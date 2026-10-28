@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import zipfile
 from datetime import date, datetime
 from typing import Any
@@ -1327,24 +1328,41 @@ def _call_gemini(parts, system, json_mode=True, temperature=0.4) -> str:
         raise AIError(f"Could not start the Gemini client: {str(e)[:300]}") from e
 
     tried: list[str] = []
+    busy: list[str] = []
     text = None
+    last_busy = ""
     for model in _model_candidates():
         tried.append(model)
-        try:
-            resp = client.models.generate_content(model=model, contents=parts, config=cfg)
-            text = resp.text
-            _WORKING_MODEL = model
+        done = False
+        for attempt in range(3):  # retry temporary overloads with a growing wait
+            try:
+                resp = client.models.generate_content(model=model, contents=parts, config=cfg)
+                text = resp.text
+                _WORKING_MODEL = model
+                done = True
+                break
+            except Exception as e:  # noqa: BLE001 - convert any SDK error to a friendly one
+                msg = str(e)
+                if "404" in msg or "NOT_FOUND" in msg:
+                    break  # this model does not exist for this key: try the next one
+                if "API_KEY_INVALID" in msg or "API key not valid" in msg or "403" in msg[:40]:
+                    raise AIError("The Gemini API key is invalid or not permitted. Check GEMINI_API_KEY.") from e
+                if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    raise AIError("Gemini free-tier quota or rate limit reached. Wait a minute and try again, or use a different key/model.") from e
+                if any(x in msg for x in ("503", "UNAVAILABLE", "500", "INTERNAL", "504", "DEADLINE", "overloaded")):
+                    last_busy = msg[:200]
+                    if attempt < 2:
+                        time.sleep(2 * (attempt + 1) + attempt * 2)  # 2s, then 6s
+                        continue
+                    busy.append(model)  # still busy after retries: try the next model
+                    break
+                raise AIError(f"Gemini request failed: {msg[:300]}") from e
+        if done:
             break
-        except Exception as e:  # noqa: BLE001 - convert any SDK error to a friendly one
-            msg = str(e)
-            if "404" in msg or "NOT_FOUND" in msg:
-                continue  # this model is unavailable: try the next one
-            if "API_KEY_INVALID" in msg or "API key not valid" in msg or "403" in msg[:40]:
-                raise AIError("The Gemini API key is invalid or not permitted. Check GEMINI_API_KEY.") from e
-            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                raise AIError("Gemini free-tier quota or rate limit reached. Wait a minute and try again, or use a different key/model.") from e
-            raise AIError(f"Gemini request failed: {msg[:300]}") from e
     else:
+        if busy:
+            raise AIError("Gemini is overloaded right now (" + ", ".join(busy) + " all busy after retries). "
+                          "This is temporary on Google's side. Wait a minute and press the button again.")
         raise AIError("None of these Gemini models were found: " + ", ".join(tried)
                       + ". Set GEMINI_MODEL to a model your API key can use (see ai.google.dev/gemini-api/docs/models).")
     if not text:
