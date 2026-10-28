@@ -54,6 +54,12 @@ INVALID_SHEET_CHARS = re.compile(r"[\[\]:*?/\\\.]")
 BLOCKED_FUNCS = ("WEBSERVICE", "CALL", "REGISTER.ID", "EXEC", "DDE", "HYPERLINK",
                  "FILTERXML", "RTD", "SHELL", "SQL.REQUEST", "MSEXCEL")
 
+# Gemini model settings. Override the default with the GEMINI_MODEL secret / env var.
+DEFAULT_MODEL = "gemini-3.6-flash"
+# Tried automatically (in order) if the chosen model returns "not found".
+FALLBACK_MODELS = ("gemini-3.7-flash", "gemini-3.5-flash", "gemini-2.5-flash")
+_WORKING_MODEL: str | None = None  # remembers the model that last worked
+
 
 class SpecError(Exception):
     """The workbook specification (or an edit) is invalid."""
@@ -1282,6 +1288,7 @@ def get_api_key() -> str | None:
 
 
 def get_model() -> str:
+    """The configured model: GEMINI_MODEL env var, then Streamlit secret, then DEFAULT_MODEL."""
     m = os.environ.get("GEMINI_MODEL")
     if not m:
         try:
@@ -1289,10 +1296,20 @@ def get_model() -> str:
             m = st.secrets.get("GEMINI_MODEL")
         except Exception:
             m = None
-    return m or "gemini-2.5-flash"
+    return m or DEFAULT_MODEL
+
+
+def _model_candidates() -> list[str]:
+    """Models to try, in order: the one that last worked, the configured one, then the fallbacks."""
+    out: list[str] = []
+    for m in (_WORKING_MODEL, get_model(), *FALLBACK_MODELS):
+        if m and m not in out:
+            out.append(m)
+    return out
 
 
 def _call_gemini(parts, system, json_mode=True, temperature=0.4) -> str:
+    global _WORKING_MODEL
     key = get_api_key()
     if not key:
         raise AIError("No Gemini API key found. Add GEMINI_API_KEY to Streamlit secrets or an environment variable.")
@@ -1306,17 +1323,30 @@ def _call_gemini(parts, system, json_mode=True, temperature=0.4) -> str:
         cfg = types.GenerateContentConfig(
             system_instruction=system, temperature=temperature,
             response_mime_type="application/json" if json_mode else None)
-        resp = client.models.generate_content(model=get_model(), contents=parts, config=cfg)
-        text = resp.text
-    except Exception as e:  # noqa: BLE001 - convert any SDK error to a friendly one
-        msg = str(e)
-        if "API_KEY_INVALID" in msg or "API key not valid" in msg or "403" in msg[:40]:
-            raise AIError("The Gemini API key is invalid or not permitted. Check GEMINI_API_KEY.") from e
-        if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-            raise AIError("Gemini free-tier quota or rate limit reached. Wait a minute and try again, or use a different key/model.") from e
-        if "404" in msg or "NOT_FOUND" in msg:
-            raise AIError(f"Model '{get_model()}' was not found. Set GEMINI_MODEL to a supported Gemini Flash model.") from e
-        raise AIError(f"Gemini request failed: {msg[:300]}") from e
+    except Exception as e:  # noqa: BLE001
+        raise AIError(f"Could not start the Gemini client: {str(e)[:300]}") from e
+
+    tried: list[str] = []
+    text = None
+    for model in _model_candidates():
+        tried.append(model)
+        try:
+            resp = client.models.generate_content(model=model, contents=parts, config=cfg)
+            text = resp.text
+            _WORKING_MODEL = model
+            break
+        except Exception as e:  # noqa: BLE001 - convert any SDK error to a friendly one
+            msg = str(e)
+            if "404" in msg or "NOT_FOUND" in msg:
+                continue  # this model is unavailable: try the next one
+            if "API_KEY_INVALID" in msg or "API key not valid" in msg or "403" in msg[:40]:
+                raise AIError("The Gemini API key is invalid or not permitted. Check GEMINI_API_KEY.") from e
+            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                raise AIError("Gemini free-tier quota or rate limit reached. Wait a minute and try again, or use a different key/model.") from e
+            raise AIError(f"Gemini request failed: {msg[:300]}") from e
+    else:
+        raise AIError("None of these Gemini models were found: " + ", ".join(tried)
+                      + ". Set GEMINI_MODEL to a model your API key can use (see ai.google.dev/gemini-api/docs/models).")
     if not text:
         raise AIError("Gemini returned an empty response (it may have been blocked). Try rephrasing.")
     return text
@@ -1491,7 +1521,8 @@ def listing_copy(spec) -> dict:
 
 
 def test_connection() -> str:
-    return _call_gemini(["Reply with the single word: ok"], "Be terse.", json_mode=False, temperature=0).strip()
+    reply = _call_gemini(["Reply with the single word: ok"], "Be terse.", json_mode=False, temperature=0).strip()
+    return f"{reply} (model: {_WORKING_MODEL or get_model()})"
 
 
 # ------------------------------------------------------------ dataset import
